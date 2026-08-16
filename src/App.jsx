@@ -16,48 +16,64 @@ import {
   SEED_LOANS,
   formatINR,
   estimateRemainingInterest,
-  monthsBetween,
+  dueDatesThrough,
+  applyEmiToLoan,
 } from "./data";
 
-const STORAGE_KEY = "asan-loan-tracker-v1";
+const STORAGE_KEY = "asan-loan-tracker-v2";
 
 function loadState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) return JSON.parse(raw);
   } catch {}
-  return {
-    loans: SEED_LOANS,
-    payments: [
-      {
-        id: "p1",
-        loanId: "icici-pl",
-        date: "2026-07-05",
-        amount: 34035,
-        note: "EMI 1 (schedule)",
-      },
-      {
-        id: "p2",
-        loanId: "hdfc-jumbo",
-        date: "2026-07-21",
-        amount: 14105,
-        note: "Autopay",
-      },
-      {
-        id: "p3",
-        loanId: "hdfc-jumbo",
-        date: "2026-08-01",
-        amount: 14105,
-        note: "Statement billing cycle",
-      },
-    ],
-  };
+  return { loans: SEED_LOANS.map((l) => ({ ...l })), payments: [] };
+}
+
+/** Auto-post EMIs for due dates that have already passed. */
+function syncAutoPayments(state, asOf = new Date()) {
+  let loans = state.loans.map((l) => ({ ...l }));
+  let payments = [...state.payments];
+  let changed = false;
+
+  for (let i = 0; i < loans.length; i++) {
+    const loan = loans[i];
+    if (loan.status === "closed") continue;
+    const dues = dueDatesThrough(loan.startDate, loan.dueDay || 5, asOf);
+    const existing = new Set(
+      payments.filter((p) => p.loanId === loan.id && p.auto).map((p) => p.date)
+    );
+
+    for (const date of dues) {
+      if (existing.has(date)) continue;
+      // also skip if manual payment already on that date
+      if (payments.some((p) => p.loanId === loan.id && p.date === date)) continue;
+
+      payments.push({
+        id: `auto-${loan.id}-${date}`,
+        loanId: loan.id,
+        date,
+        amount: loan.emi,
+        note: `Auto EMI · due ${loan.dueDay}th`,
+        auto: true,
+      });
+      changed = true;
+    }
+
+    const paidCount = dues.length;
+    if (paidCount !== (loan.emisPaid || 0) || changed) {
+      loans[i] = applyEmiToLoan(loan, paidCount);
+      changed = true;
+    }
+  }
+
+  payments.sort((a, b) => b.date.localeCompare(a.date));
+  return { loans, payments, changed };
 }
 
 function monthsLeftFor(loan) {
   if (loan.balanceTenureMonths != null) return loan.balanceTenureMonths;
-  const elapsed = Math.max(loan.emisPaid || 0, monthsBetween(loan.startDate));
-  return Math.max(0, loan.tenureMonths - elapsed);
+  return Math.max(0, loan.tenureMonths - (loan.emisPaid || 0));
 }
 
 function interestPending(loan) {
@@ -70,7 +86,11 @@ function interestPending(loan) {
 }
 
 export default function App() {
-  const [state, setState] = useState(loadState);
+  const [state, setState] = useState(() => {
+    const base = loadState();
+    const synced = syncAutoPayments(base);
+    return { loans: synced.loans, payments: synced.payments };
+  });
   const [bankFilter, setBankFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState("active");
   const [showPay, setShowPay] = useState(false);
@@ -85,6 +105,20 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   }, [state]);
+
+  // Re-check due dates on load and every hour (covers 5th / 21st auto EMI)
+  useEffect(() => {
+    const run = () => {
+      setState((prev) => {
+        const synced = syncAutoPayments(prev);
+        if (!synced.changed) return prev;
+        return { loans: synced.loans, payments: synced.payments };
+      });
+    };
+    run();
+    const id = setInterval(run, 60 * 60 * 1000);
+    return () => clearInterval(id);
+  }, []);
 
   const loans = state.loans;
 
@@ -218,6 +252,13 @@ export default function App() {
       </header>
 
       <main className="max-w-5xl mx-auto px-4 py-6 space-y-6">
+        <div className="card p-3 text-xs text-slate-400 leading-relaxed">
+          Auto EMI: <span className="text-slate-200">ICICI on the 5th</span>,{" "}
+          <span className="text-slate-200">HDFC on the 21st</span>. When the date is reached, payment is logged and outstanding updates.
+          Today treated as{" "}
+          <span className="text-emerald-400 font-medium">{new Date().toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}</span>.
+        </div>
+
         {/* Summary */}
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
           {[
@@ -347,7 +388,8 @@ export default function App() {
                   </div>
 
                   <div className="mt-3 text-[11px] text-slate-500">
-                    Start {loan.startDate} · EMIs paid {loan.emisPaid || 0}/{loan.tenureMonths}
+                    Start {loan.startDate} · Due every month on <span className="text-slate-300 font-medium">{loan.dueDay}th</span>
+                    {" · "}EMIs paid {loan.emisPaid || 0}/{loan.tenureMonths}
                   </div>
                 </motion.div>
               );
